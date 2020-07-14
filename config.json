@@ -1,0 +1,8 @@
+{
+	"tokenizer": "transformers.BertTokenizer",
+	"tokenizer_path": "bert-large-cased",
+        "model": "transformers.BertModel",
+        "pad_token": "[PAD]",
+        "sep_token": "[SEP]",
+        "cls_token": "[CLS]"
+}
