@@ -1,11 +1,11 @@
 {
-	"tokenizer": "transformers.BertTokenizer",
-	"tokenizer_path": "bert-large-cased",
-        "model": "transformers.BertModel",
-	"model_config": "transformers.BertConfig",
+	"tokenizer": "transformers.AlbertTokenizer",
+	"tokenizer_path": "albert-base-v1",
+        "model": "transformers.AlbertModel",
+	"model_config": "transformers.AlbertConfig",
 	"seq_length": 256,
 	"layer": 11,
-	"n_embed": 1024,
+	"n_embed": 768,
         "pad_token": "[PAD]",
         "sep_token": "[SEP]",
         "cls_token": "[CLS]",
@@ -14,9 +14,9 @@
         "valid_file": "split/valid.csv",
 	"before_field": ["NEWS1_HEADLINE", "NEWS1_BODY"],
 	"after_field": ["NEWS2_HEADLINE", "NEWS2_BODY"],
-	"batch_size": 12,
+	"batch_size": 6,
 	"num_workers": 8,
-	"lr": 1e-6,
+	"lr": 3e-5,
 	"gamma": 0.9,
 	"weight_decay": 0.0
 }
