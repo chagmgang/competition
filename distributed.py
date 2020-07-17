@@ -37,15 +37,15 @@ def main():
     hvd.init()
     config = json.load(open('config.json'))
     torch.cuda.set_device(hvd.local_rank())
-    
+
     writer = Logging(
             user='ckg',
-            name=f'bert_large_{hvd.local_rank()}')
+            name=f'albert_{hvd.local_rank()}')
     writer.add_hparams(config)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    trainset = dataset.dataset.SequenceDataset(
+
+    trainset = dataset.dataset.SequenceDatasetTrain(
             config=config,
             csv_file=config['train_file'])
     trainsampler = torch.utils.data.distributed.DistributedSampler(
@@ -57,7 +57,8 @@ def main():
             batch_size=config['batch_size'],
             num_workers=config['num_workers'],
             sampler=trainsampler)
-    validset = dataset.dataset.SequenceDataset(
+
+    validset = dataset.dataset.SequenceDatasetValid(
             config=config,
             csv_file=config['train_file'])
     validsampler = torch.utils.data.distributed.DistributedSampler(
@@ -106,7 +107,7 @@ def main():
             after_segment = after_segment.to(device)
             after_attention = after_attention.to(device)
             label = label.to(device)
-            
+
             optimizer.zero_grad()
             logit = net(
                     before_input=before_input,
