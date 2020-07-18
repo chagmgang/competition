@@ -42,7 +42,7 @@ def main():
             user='ckg',
             name=f'albert_{hvd.local_rank()}')
     writer.add_hparams(config)
-    
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     trainset = dataset.dataset.SequenceDatasetTrain(
@@ -60,7 +60,7 @@ def main():
 
     validset = dataset.dataset.SequenceDatasetValid(
             config=config,
-            csv_file=config['train_file'])
+            csv_file=config['valid_file'])
     validsampler = torch.utils.data.distributed.DistributedSampler(
             validset,
             num_replicas=hvd.size(),
@@ -92,30 +92,25 @@ def main():
             root_rank=0)
 
     train_step = 0
+    valid_step = 0
     for epoch in range(100):
 
         net.train()
         train_loss, train_acc = 0, 0
-        for before_input, before_segment, before_attention, after_input, after_segment, after_attention, label in tqdm.tqdm(trainloader):
+        for input_ids, segment_ids, attention_ids, label in tqdm.tqdm(trainloader):
 
             train_step += 1
 
-            before_input = before_input.to(device)
-            before_segment = before_segment.to(device)
-            before_attention = before_attention.to(device)
-            after_input = after_input.to(device)
-            after_segment = after_segment.to(device)
-            after_attention = after_attention.to(device)
+            input_ids = input_ids.to(device)
+            segment_ids = segment_ids.to(device)
+            attention_ids = attention_ids.to(device)
             label = label.to(device)
 
             optimizer.zero_grad()
             logit = net(
-                    before_input=before_input,
-                    before_segment=before_segment,
-                    before_attention=before_attention,
-                    after_input=after_input,
-                    after_segment=after_segment,
-                    after_attention=after_attention)
+                    input_ids=input_ids,
+                    segment_ids=segment_ids,
+                    attention_ids=attention_ids)
             step_loss = criterion(logit, label)
             step_loss.backward()
             optimizer.step()
@@ -125,37 +120,45 @@ def main():
 
             writer.add_scalar('data/step_train_loss', step_loss.item(), train_step)
             writer.add_scalar('data/step_train_acc', pred, train_step)
+            writer.add_scalar('data/lr', scheduler.get_lr()[0], train_step)
 
             train_loss += step_loss.item()
             train_acc += pred
 
+            if train_step % config['valid_step'] == 0:
+                valid_step += 1
+                valid_loss, valid_acc = engine.bert.valid(
+                        net=net,
+                        criterion=criterion,
+                        dataloader=validloader,
+                        device=device)
+                engine.bert.save(
+                        net=net,
+                        save_path=f'saved/bert_{train_step}.pt')
+                scheduler.step()
+
+                print('-------------------------')
+                print(f'valid step : {valid_step}')
+                print(f'valid loss : {valid_loss}')
+                print(f'valid acc  : {valid_acc}')
+                print('-------------------------')
+
+                writer.add_scalar('data/valid_loss', valid_loss, valid_step)
+                writer.add_scalar('data/valid_acc', valid_acc, valid_step)
+
+                net.train()
+
         train_loss /= len(trainloader)
         train_acc /= len(trainloader)
 
-        writer.add_scalar('data/epoch_train_loss', train_loss, epoch)
-        writer.add_scalar('data/epoch_train_acc', train_acc, epoch)
-
-        valid_loss, valid_acc = engine.bert.valid(
-                net=net,
-                criterion=criterion,
-                dataloader=validloader,
-                device=device)
-
-        writer.add_scalar('data/epoch_valid_loss', valid_loss, epoch)
-        writer.add_scalar('data/epoch_valid_acc', valid_acc, epoch)
-
-        scheduler.step()
-
-        print('----------------')
+        print('-------------------------')
         print(f'epoch : {epoch}')
         print(f'train loss : {train_loss}')
         print(f'train acc  : {train_acc}')
-        print(f'valid loss : {valid_loss}')
-        print(f'valid acc  : {valid_acc}')
-        print('----------------')
-
-        if hvd.local_rank() == 0:
-            torch.save(net.state_dict(), 'saved/bert.pt')
+        print('-------------------------')
+        
+        writer.add_scalar('data/epoch_train_loss', train_loss, epoch)
+        writer.add_scalar('data/epoch_train_acc', train_acc, epoch)
 
 if __name__ == '__main__':
     main()

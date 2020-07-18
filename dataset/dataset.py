@@ -30,40 +30,41 @@ class SequenceDatasetValid(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         data = self.dataframe.loc[idx]
 
-        before_text = [str(data[f]) for f in self.config['before_field']]
-        after_text = [str(data[f]) for f in self.config['after_field']]
+        text = [str(data[f]) for f in self.config['before_field']]
+        tokens = [self.tokenizer.tokenize(t) for t in text]
 
-        before_input, before_segment, before_attention = self.combine(before_text)
-        after_input, after_segment, after_attention = self.combine(after_text)
+        sequence, segment, attention = self.token_combine(
+                tokens[0],
+                tokens[1])
 
-        before_input = torch.as_tensor(before_input, dtype=torch.long)
-        before_segment = torch.as_tensor(before_segment, dtype=torch.long)
-        before_attention = torch.as_tensor(before_attention, dtype=torch.long)
-
-        after_input = torch.as_tensor(after_input, dtype=torch.long)
-        after_segment = torch.as_tensor(after_segment, dtype=torch.long)
-        after_attention = torch.as_tensor(after_attention, dtype=torch.long)
+        sequence = torch.as_tensor(sequence, dtype=torch.long)
+        segment = torch.as_tensor(segment, dtype=torch.long)
+        attention = torch.as_tensor(attention, dtype=torch.long)
 
         label = data['LABEL']
         label = torch.as_tensor(label, dtype=torch.long)
 
-        return before_input, before_segment, before_attention,\
-                after_input, after_segment, after_attention, label
+        return sequence, segment, attention, label
 
-    def combine(self, text_list):
-        tokenized_text = [self.tokenizer.tokenize(t) for t in text_list]
+    def token_combine(self, sequence1, sequence2):
+        max_sequence_length = int((self.length - 2) / 2)
+        sequence1 = sequence1[:max_sequence_length]
+        sequence2 = sequence2[:max_sequence_length]
 
         tokens = [self.cls_token]
         segment_ids = [0]
 
-        for i, t in enumerate(tokenized_text):
-            segment = (i % 2)
+        tokens.extend(sequence1)
+        segment_ids.extend([0 for _ in range(len(sequence1))])
 
-            tokens.extend(t)
-            tokens.append(self.sep_token)
+        tokens.append(self.sep_token)
+        segment_ids.append(0)
 
-            segment_ids.extend([segment for _ in range(len(t))])
-            segment_ids.append(segment)
+        tokens.extend(sequence2)
+        segment_ids.extend([1 for _ in range(len(sequence2))])
+
+        tokens.append(self.sep_token)
+        segment_ids.append(1)
 
         attention_mask = [1 for _ in range(len(tokens))]
 
@@ -73,8 +74,12 @@ class SequenceDatasetValid(torch.utils.data.Dataset):
 
         while len(tokens) < self.length:
             tokens.append(self.pad_token)
-            segment_ids.append((i+1) % 2)
+            segment_ids.append(0)
             attention_mask.append(0)
+
+        assert len(tokens) == len(segment_ids)
+        assert len(tokens) == len(attention_mask)
+        assert len(tokens) <= self.length
 
         input_ids = self.tokenizer.convert_tokens_to_ids(tokens)
 
@@ -106,61 +111,72 @@ class SequenceDatasetTrain(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         data = self.dataframe.loc[idx]
 
-        before_text = [str(data[f]) for f in self.config['before_field']]
-        after_text = [str(data[f]) for f in self.config['after_field']]
+        text = [str(data[f]) for f in self.config['before_field']]
+        tokens = [self.tokenizer.tokenize(t) for t in text]
 
-        before_masking_index = data['NEWS1_MASKING_INDEX']
-        after_masking_index = data['NEWS2_MASKING_INDEX']
+        '''
+        mask_index1 = data['NEWS1_MASKING_INDEX']
+        mask_index2 = data['NEWS2_MASKING_INDEX']
 
-        before_masking_index = before_masking_index.split(',')[:-1]
-        after_masking_index = after_masking_index.split(',')[:-1]
+        mask_index1 = mask_index1.split(',')[:-1]
+        mask_index2 = mask_index2.split(',')[:-1]
 
-        before_masking_index = [int(i) for i in before_masking_index]
-        after_masking_index = [int(i) for i in after_masking_index]
+        mask_index1 = [int(i) for i in mask_index1]
+        mask_index2 = [int(i) for i in mask_index2]
 
-        before_input, before_segment, before_attention = self.combine(
-                text_list=before_text,
-                mask_text=1,
-                mask_index=before_masking_index)
+        mask_index1 = mask_index1[:3]
+        mask_index2 = mask_index2[:3]
 
-        after_input, after_segment, after_attention = self.combine(
-                text_list=after_text,
-                mask_text=1,
-                mask_index=after_masking_index)
+        sequence, segment, attention = self.token_combine(
+                tokens[0],
+                tokens[1],
+                mask_index1,
+                mask_index2)
 
-        before_input = torch.as_tensor(before_input, dtype=torch.long)
-        before_segment = torch.as_tensor(before_segment, dtype=torch.long)
-        before_attention = torch.as_tensor(before_attention, dtype=torch.long)
+        '''
+        sequence, segment, attention = self.token_combine(
+                tokens[0],
+                tokens[1],
+                None,
+                None)
 
-        after_input = torch.as_tensor(after_input, dtype=torch.long)
-        after_segment = torch.as_tensor(after_segment, dtype=torch.long)
-        after_attention = torch.as_tensor(after_attention, dtype=torch.long)
+        sequence = torch.as_tensor(sequence, dtype=torch.long)
+        segment = torch.as_tensor(segment, dtype=torch.long)
+        attention = torch.as_tensor(attention, dtype=torch.long)
 
         label = data['LABEL']
         label = torch.as_tensor(label, dtype=torch.long)
 
-        return before_input, before_segment, before_attention,\
-                after_input, after_segment, after_attention, label
+        return sequence, segment, attention, label
 
-    def combine(self, text_list, mask_text, mask_index):
-        tokenized_text = [self.tokenizer.tokenize(t) for t in text_list]
+    def token_combine(self, sequence1, sequence2, mask_index1, mask_index2):
+        max_sequence_length = int((self.length - 2) / 2)
+        sequence1 = sequence1[:max_sequence_length]
+        sequence2 = sequence2[:max_sequence_length]
+
+        '''
+        for m in mask_index1:
+            if m < len(sequence1):
+                sequence1[m] = self.mask_token
+        for m in mask_index2:
+            if m < len(sequence2):
+                sequence2[m] = self.mask_token
+        '''
 
         tokens = [self.cls_token]
         segment_ids = [0]
 
-        for i, t in enumerate(tokenized_text):
+        tokens.extend(sequence1)
+        segment_ids.extend([0 for _ in range(len(sequence1))])
 
-            segment = (i % 2)
+        tokens.append(self.sep_token)
+        segment_ids.append(0)
 
-            if i == mask_text:
-                for j in mask_index:
-                    t[j] = self.mask_token
+        tokens.extend(sequence2)
+        segment_ids.extend([1 for _ in range(len(sequence2))])
 
-            tokens.extend(t)
-            tokens.append(self.sep_token)
-
-            segment_ids.extend([segment for _ in range(len(t))])
-            segment_ids.append(segment)
+        tokens.append(self.sep_token)
+        segment_ids.append(1)
 
         attention_mask = [1 for _ in range(len(tokens))]
 
@@ -169,10 +185,13 @@ class SequenceDatasetTrain(torch.utils.data.Dataset):
         attention_mask = attention_mask[:self.length]
 
         while len(tokens) < self.length:
-
             tokens.append(self.pad_token)
-            segment_ids.append((i+1) % 2)
+            segment_ids.append(0)
             attention_mask.append(0)
+
+        assert len(tokens) == len(segment_ids)
+        assert len(tokens) == len(attention_mask)
+        assert len(tokens) <= self.length
 
         input_ids = self.tokenizer.convert_tokens_to_ids(tokens)
 
@@ -320,4 +339,4 @@ if __name__ == '__main__':
     SplitData(
             config,
             ratio=0.8,
-            repeat=4)
+            repeat=1)
