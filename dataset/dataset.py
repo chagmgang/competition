@@ -1,4 +1,5 @@
 import tqdm
+import copy
 import json
 import torch
 import transformers
@@ -7,336 +8,190 @@ import torchvision
 import numpy as np
 import pandas as pd
 
-class SequenceDatasetValid(torch.utils.data.Dataset):
+def csv_to_dataframe(config, dataframe, arange, tokenizer):
+
+    columns = copy.deepcopy(config['mask_field'])
+    reverse_columns = copy.deepcopy(config['mask_field'])
+    reverse_columns.reverse()
+    mask_columns = copy.deepcopy(config['mask_column'])
+
+    data = {}
+    for mask_column in mask_columns:
+        data[mask_column] = list()
+    for mask_column in mask_columns:
+        data[f'{mask_column}_index'] = list()
+    data['LABEL'] = list()
+
+    for i, idx in enumerate(tqdm.tqdm(arange)):
+
+        single_data = dataframe.loc[idx]
+        for x, y in zip(columns, mask_columns):
+            data[y].append(single_data[x])
+            token = tokenizer.tokenize(single_data[x])
+            length = len(token)
+            mask_arange = np.arange(length)
+            np.random.shuffle(mask_arange)
+            mask_arange = mask_arange[:int(length * config['mask_ratio'])]
+            arange_string = ''
+            for k in mask_arange:
+                arange_string += f'{k},'
+            data[f'{y}_index'].append(arange_string)
+        data['LABEL'].append(0)
+
+        for x, y in zip(reverse_columns, mask_columns):
+            data[y].append(single_data[x])
+            token = tokenizer.tokenize(single_data[x])
+            length = len(token)
+            mask_arange = np.arange(length)
+            np.random.shuffle(mask_arange)
+            mask_arange = mask_arange[:int(length * config['mask_ratio'])]
+            arange_string = ''
+            for k in mask_arange:
+                arange_string += f'{k},'
+            data[f'{y}_index'].append(arange_string)
+        data['LABEL'].append(1)
+
+    return pd.DataFrame.from_dict(data)
+
+def make_mask_dataset(config):
+
+    dataframe = pd.read_csv(config['csv_file'])
+
+    arange = np.arange(len(dataframe))
+    np.random.shuffle(arange)
+
+    tokenizer = eval(config['tokenizer'])
+    tokenizer = tokenizer.from_pretrained(config['tokenizer_path'])
+
+    cut_index = int(len(arange) * 0.8)
+
+    train_df = csv_to_dataframe(
+            config=config,
+            dataframe=dataframe,
+            arange=arange[:cut_index],
+            tokenizer=tokenizer)
+
+    valid_df = csv_to_dataframe(
+            config=config,
+            dataframe=dataframe,
+            arange=arange[cut_index:],
+            tokenizer=tokenizer)
+
+    train_df.to_csv(config['mask_train_file'], index=False)
+    valid_df.to_csv(config['mask_valid_file'], index=False)
+
+class MaskedLMDataset(torch.utils.data.Dataset):
 
     def __init__(self, csv_file, config):
 
-        self.config = config
         self.dataframe = pd.read_csv(csv_file)
+        self.config = config
         self.tokenizer = eval(config['tokenizer'])
         self.tokenizer = self.tokenizer.from_pretrained(config['tokenizer_path'])
-
-        self.cls_ids = self.tokenizer.convert_tokens_to_ids([config['cls_token']])[0]
-        self.pad_ids = self.tokenizer.convert_tokens_to_ids([config['pad_token']])[0]
-        self.sep_ids = self.tokenizer.convert_tokens_to_ids([config['sep_token']])[0]
-
-        self.cls_token = config['cls_token']
-        self.pad_token = config['pad_token']
-        self.sep_token = config['sep_token']
-        self.mask_token = config['mask_token']
-
-        self.length = config['seq_length']
 
     def __getitem__(self, idx):
         data = self.dataframe.loc[idx]
 
-        text = [str(data[f]) for f in self.config['before_field']]
+        seq_labels = data['LABEL']
+
+        text = [data[f] for f in self.config['mask_column']]
+        mask_indexs = [data[f'{f}_index'] for f in self.config['mask_column']]
+        mask_indexs = self.regex(mask_indexs)
+
         tokens = [self.tokenizer.tokenize(t) for t in text]
+        labels = copy.deepcopy(tokens)
 
-        sequence, segment, attention = self.token_combine(
-                tokens[0],
-                tokens[1])
+        ids = [self.tokenizer.convert_tokens_to_ids(token) for token in tokens]
+        labels = [self.tokenizer.convert_tokens_to_ids(token) for token in labels]
 
-        sequence = torch.as_tensor(sequence, dtype=torch.long)
-        segment = torch.as_tensor(segment, dtype=torch.long)
-        attention = torch.as_tensor(attention, dtype=torch.long)
+        masked_ids = self.mask_ids(ids, mask_indexs)
+        masked_ids, segment_ids, attention_mask = self.combine(masked_ids)
+        labels, _, _ = self.combine(labels)
 
-        label = data['LABEL']
-        label = torch.as_tensor(label, dtype=torch.long)
+        masked_ids = self.padding(
+                masked_ids,
+                self.config['seq_length'],
+                self.tokenizer.pad_token_id)
+        segment_ids = self.padding(
+                segment_ids,
+                self.config['seq_length'],
+                0)
+        attention_mask = self.padding(
+                attention_mask,
+                self.config['seq_length'],
+                0)
+        labels = self.padding(
+                labels,
+                self.config['seq_length'],
+                self.tokenizer.pad_token_id)
 
-        return sequence, segment, attention, label
+        masked_ids = torch.as_tensor(masked_ids, dtype=torch.long)
+        segment_ids = torch.as_tensor(segment_ids, dtype=torch.long)
+        attention_mask = torch.as_tensor(attention_mask, dtype=torch.long)
+        labels = torch.as_tensor(labels, dtype=torch.long)
+        seq_labels = torch.as_tensor(seq_labels, dtype=torch.long)
 
-    def token_combine(self, sequence1, sequence2):
-        max_sequence_length = int((self.length - 2) / 2)
-        sequence1 = sequence1[:max_sequence_length]
-        sequence2 = sequence2[:max_sequence_length]
+        return masked_ids, segment_ids, attention_mask, labels, seq_labels
 
-        tokens = [self.cls_token]
-        segment_ids = [0]
+    def padding(self, inputs, length, value):
+        inputs = inputs[:length]
 
-        tokens.extend(sequence1)
-        segment_ids.extend([0 for _ in range(len(sequence1))])
+        while len(inputs) < length:
+            inputs.append(value)
 
-        tokens.append(self.sep_token)
-        segment_ids.append(0)
+        return inputs
 
-        tokens.extend(sequence2)
-        segment_ids.extend([1 for _ in range(len(sequence2))])
+    def combine(self, ids):
+        ids0 = ids[0]
+        ids1 = ids[1]
 
-        tokens.append(self.sep_token)
-        segment_ids.append(1)
+        ids = self.tokenizer.build_inputs_with_special_tokens(
+                token_ids_0=ids0,
+                token_ids_1=ids1)
 
-        attention_mask = [1 for _ in range(len(tokens))]
+        segment = self.tokenizer.create_token_type_ids_from_sequences(
+                token_ids_0=ids0,
+                token_ids_1=ids1)
 
-        tokens = tokens[:self.length]
-        segment_ids = segment_ids[:self.length]
-        attention_mask = attention_mask[:self.length]
+        attention_mask = [1] * len(ids)
 
-        while len(tokens) < self.length:
-            tokens.append(self.pad_token)
-            segment_ids.append(0)
-            attention_mask.append(0)
+        return ids, segment, attention_mask
 
-        assert len(tokens) == len(segment_ids)
-        assert len(tokens) == len(attention_mask)
-        assert len(tokens) <= self.length
+    def mask_ids(self, tokens, mask_indexs):
+        for token, mask_index in zip(tokens, mask_indexs):
+            for index in mask_index:
+                token[index] = self.tokenizer.mask_token_id
+        return tokens
 
-        input_ids = self.tokenizer.convert_tokens_to_ids(tokens)
-
-        return input_ids, segment_ids, attention_mask
+    def regex(self, index):
+        result = []
+        for i in index:
+            i = i.split(',')[:-1]
+            i = [int(ii) for ii in i]
+            result.append(i)
+        return result
 
     def __len__(self):
         return len(self.dataframe)
-
-class SequenceDatasetTrain(torch.utils.data.Dataset):
-
-    def __init__(self, csv_file, config):
-
-        self.config = config
-        self.dataframe = pd.read_csv(csv_file)
-        self.tokenizer = eval(config['tokenizer'])
-        self.tokenizer = self.tokenizer.from_pretrained(config['tokenizer_path'])
-
-        self.cls_ids = self.tokenizer.convert_tokens_to_ids([config['cls_token']])[0]
-        self.pad_ids = self.tokenizer.convert_tokens_to_ids([config['pad_token']])[0]
-        self.sep_ids = self.tokenizer.convert_tokens_to_ids([config['sep_token']])[0]
-
-        self.cls_token = config['cls_token']
-        self.pad_token = config['pad_token']
-        self.sep_token = config['sep_token']
-        self.mask_token = config['mask_token']
-
-        self.length = config['seq_length']
-
-    def __getitem__(self, idx):
-        data = self.dataframe.loc[idx]
-
-        text = [str(data[f]) for f in self.config['before_field']]
-        tokens = [self.tokenizer.tokenize(t) for t in text]
-
-        '''
-        mask_index1 = data['NEWS1_MASKING_INDEX']
-        mask_index2 = data['NEWS2_MASKING_INDEX']
-
-        mask_index1 = mask_index1.split(',')[:-1]
-        mask_index2 = mask_index2.split(',')[:-1]
-
-        mask_index1 = [int(i) for i in mask_index1]
-        mask_index2 = [int(i) for i in mask_index2]
-
-        mask_index1 = mask_index1[:3]
-        mask_index2 = mask_index2[:3]
-
-        sequence, segment, attention = self.token_combine(
-                tokens[0],
-                tokens[1],
-                mask_index1,
-                mask_index2)
-
-        '''
-        sequence, segment, attention = self.token_combine(
-                tokens[0],
-                tokens[1],
-                None,
-                None)
-
-        sequence = torch.as_tensor(sequence, dtype=torch.long)
-        segment = torch.as_tensor(segment, dtype=torch.long)
-        attention = torch.as_tensor(attention, dtype=torch.long)
-
-        label = data['LABEL']
-        label = torch.as_tensor(label, dtype=torch.long)
-
-        return sequence, segment, attention, label
-
-    def token_combine(self, sequence1, sequence2, mask_index1, mask_index2):
-        max_sequence_length = int((self.length - 2) / 2)
-        sequence1 = sequence1[:max_sequence_length]
-        sequence2 = sequence2[:max_sequence_length]
-
-        '''
-        for m in mask_index1:
-            if m < len(sequence1):
-                sequence1[m] = self.mask_token
-        for m in mask_index2:
-            if m < len(sequence2):
-                sequence2[m] = self.mask_token
-        '''
-
-        tokens = [self.cls_token]
-        segment_ids = [0]
-
-        tokens.extend(sequence1)
-        segment_ids.extend([0 for _ in range(len(sequence1))])
-
-        tokens.append(self.sep_token)
-        segment_ids.append(0)
-
-        tokens.extend(sequence2)
-        segment_ids.extend([1 for _ in range(len(sequence2))])
-
-        tokens.append(self.sep_token)
-        segment_ids.append(1)
-
-        attention_mask = [1 for _ in range(len(tokens))]
-
-        tokens = tokens[:self.length]
-        segment_ids = segment_ids[:self.length]
-        attention_mask = attention_mask[:self.length]
-
-        while len(tokens) < self.length:
-            tokens.append(self.pad_token)
-            segment_ids.append(0)
-            attention_mask.append(0)
-
-        assert len(tokens) == len(segment_ids)
-        assert len(tokens) == len(attention_mask)
-        assert len(tokens) <= self.length
-
-        input_ids = self.tokenizer.convert_tokens_to_ids(tokens)
-
-        return input_ids, segment_ids, attention_mask
-
-    def __len__(self):
-        return len(self.dataframe)
-
-class SplitData:
-
-    def __init__(self, config, ratio, repeat):
-
-        self.config = config
-        self.repeat = repeat
-        self.ratio = ratio
-
-        self.tokenizer = eval(config['tokenizer'])
-        self.tokenizer = self.tokenizer.from_pretrained(config['tokenizer_path'])
-
-        self.df = pd.read_csv(config['csv_file'])
-        self.df_length = len(self.df)
-        self.ratio = ratio
-
-        self.tokenizer = eval(config['tokenizer'])
-        self.tokenizer = self.tokenizer.from_pretrained(config['tokenizer_path'])
-
-        self.df = pd.read_csv(config['csv_file'])
-        self.df_length = len(self.df)
-        self.arange = np.arange(self.df_length)
-        np.random.shuffle(self.arange)
-
-        self.train_idx = self.arange[:int(self.df_length * ratio)]
-        self.valid_idx = self.arange[int(self.df_length * ratio):]
-
-        
-        train_data = {}
-        train_data['INDEX'] = []
-        train_data['NEWS1_HEADLINE'] = []
-        train_data['NEWS1_BODY'] = []
-        train_data['NEWS1_MASKING_INDEX'] = []
-        train_data['NEWS2_HEADLINE'] = []
-        train_data['NEWS2_BODY'] = []
-        train_data['NEWS2_MASKING_INDEX'] = []
-        train_data['LABEL'] = []
-
-        train_step = 0
-        for idx in tqdm.tqdm(self.train_idx):
-
-            data = self.df.loc[idx]
-
-            before_headline = data['BEFORE_HEADLINE']
-            before_body    = data['BEFORE_BODY']
-            after_headline = data['AFTER_HEADLINE']
-            after_body     = data['AFTER_BODY']
-
-            for _ in range(repeat):
-
-                before_body_masking_index = self.get_mask_index(before_body)
-                after_body_masking_index = self.get_mask_index(after_body)
-
-                train_data['INDEX'].append(train_step)
-                train_data['NEWS1_HEADLINE'].append(before_headline)
-                train_data['NEWS1_BODY'].append(before_body)
-                train_data['NEWS1_MASKING_INDEX'].append(before_body_masking_index)
-                train_data['NEWS2_HEADLINE'].append(after_headline)
-                train_data['NEWS2_BODY'].append(after_body)
-                train_data['NEWS2_MASKING_INDEX'].append(after_body_masking_index)
-                train_data['LABEL'].append(0)
-
-                train_step += 1
-
-            for _ in range(repeat):
-
-                before_body_masking_index = self.get_mask_index(before_body)
-                after_body_masking_index = self.get_mask_index(after_body)
-
-                train_data['INDEX'].append(train_step)
-                train_data['NEWS2_HEADLINE'].append(before_headline)
-                train_data['NEWS2_BODY'].append(before_body)
-                train_data['NEWS2_MASKING_INDEX'].append(before_body_masking_index)
-                train_data['NEWS1_HEADLINE'].append(after_headline)
-                train_data['NEWS1_BODY'].append(after_body)
-                train_data['NEWS1_MASKING_INDEX'].append(after_body_masking_index)
-                train_data['LABEL'].append(1)
-
-                train_step += 1
-
-        train_df = pd.DataFrame.from_dict(train_data)
-        train_df.to_csv(config['train_file'], index=False)
-
-        valid_data = {}
-        valid_data['INDEX'] = []
-        valid_data['NEWS1_HEADLINE'] = []
-        valid_data['NEWS1_BODY'] = []
-        valid_data['NEWS2_HEADLINE'] = []
-        valid_data['NEWS2_BODY'] = []
-        valid_data['LABEL'] = []
-
-        valid_step = 0
-        for idx in tqdm.tqdm(self.valid_idx):
-
-            data = self.df.loc[idx]
-
-            before_headline = data['BEFORE_HEADLINE']
-            before_body = data['BEFORE_BODY']
-            after_headline = data['AFTER_HEADLINE']
-            after_body = data['AFTER_BODY']
-
-            valid_data['INDEX'].append(valid_step)
-            valid_data['NEWS1_HEADLINE'].append(before_headline)
-            valid_data['NEWS1_BODY'].append(before_body)
-            valid_data['NEWS2_HEADLINE'].append(after_headline)
-            valid_data['NEWS2_BODY'].append(after_body)
-            valid_data['LABEL'].append(0)
-            
-            valid_step += 1
-
-            valid_data['INDEX'].append(valid_step)
-            valid_data['NEWS2_HEADLINE'].append(before_headline)
-            valid_data['NEWS2_BODY'].append(before_body)
-            valid_data['NEWS1_HEADLINE'].append(after_headline)
-            valid_data['NEWS1_BODY'].append(after_body)
-            valid_data['LABEL'].append(1)
-
-            valid_step += 1
-
-        valid_df = pd.DataFrame.from_dict(valid_data)
-        valid_df.to_csv(config['valid_file'], index=False)
-
-    def get_mask_index(self, text):
-        tokens = self.tokenizer.tokenize(text)
-        length = len(tokens)
-        arange = np.arange(length)
-        np.random.shuffle(arange)
-        idx = arange[:int(length * self.config['mask_ratio'])]
-        idx_string = ''
-        for i in idx:
-            idx_string += f'{i},'
-        return idx_string
 
 if __name__ == '__main__':
-
     config = json.load(open('config.json'))
+    
+    make_mask_dataset(
+            config=config)
+    
+    dataset = MaskedLMDataset(
+            csv_file=config['mask_valid_file'],
+            config=config)
 
-    SplitData(
-            config,
-            ratio=0.8,
-            repeat=1)
+    print(len(dataset))
+
+    dataloader = torch.utils.data.DataLoader(
+            dataset=dataset,
+            batch_size=32,
+            num_workers=8)
+
+    for data in dataloader:
+        for d in data:
+            print(d.shape)
+            print('-----')

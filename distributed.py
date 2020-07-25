@@ -45,120 +45,183 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    trainset = dataset.dataset.SequenceDatasetTrain(
-            config=config,
-            csv_file=config['train_file'])
+    trainset = dataset.dataset.TotalDataset(
+        csv_file=config['train_file'],
+        config=config)
     trainsampler = torch.utils.data.distributed.DistributedSampler(
-            trainset,
-            num_replicas=hvd.size(),
-            rank=hvd.rank())
+        trainset,
+        num_replicas=hvd.size(),
+        rank=hvd.rank())
     trainloader = torch.utils.data.DataLoader(
-            dataset=trainset,
-            batch_size=config['batch_size'],
-            num_workers=config['num_workers'],
-            sampler=trainsampler)
+        dataset=trainset,
+        batch_size=config['batch_size'],
+        num_workers=config['num_workers'],
+        sampler=trainsampler)
 
-    validset = dataset.dataset.SequenceDatasetValid(
-            config=config,
-            csv_file=config['valid_file'])
+    validset = dataset.dataset.TotalDataset(
+        csv_file=config['valid_file'],
+        config=config)
     validsampler = torch.utils.data.distributed.DistributedSampler(
-            validset,
-            num_replicas=hvd.size(),
-            rank=hvd.rank())
+        validset,
+        num_replicas=hvd.size(),
+        rank=hvd.rank())
     validloader = torch.utils.data.DataLoader(
-            dataset=validset,
-            batch_size=config['batch_size'],
-            num_workers=config['num_workers'],
-            sampler=validsampler)
+        dataset=validset,
+        batch_size=config['batch_size'],
+        num_workers=config['num_workers'],
+        sampler=validsampler)
 
-    net = model.bert.Model(
-            config=config).to(device)
+    net = model.bert.Model(config=config).to(device)
 
     optimizer = torch.optim.Adam(
-            params=net.parameters(),
-            lr=config['lr'],
-            weight_decay=config['weight_decay'])
+        params=net.parameters(),
+        lr=config['lr'],
+        weight_decay=config['weight_decay'])
     optimizer = hvd.DistributedOptimizer(
             optimizer=optimizer,
             named_parameters=net.named_parameters())
 
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(
-            optimizer=optimizer,
-            gamma=config['gamma'])
-
-    criterion = torch.nn.CrossEntropyLoss()
     hvd.broadcast_parameters(
             net.state_dict(),
             root_rank=0)
 
     train_step = 0
-    valid_step = 0
     for epoch in range(100):
 
+        train_mlm_loss, train_seq_loss, train_seq_acc = 0, 0, 0
         net.train()
-        train_loss, train_acc = 0, 0
-        for input_ids, segment_ids, attention_ids, label in tqdm.tqdm(trainloader):
+        for data in tqdm.tqdm(trainloader):
 
             train_step += 1
 
-            input_ids = input_ids.to(device)
-            segment_ids = segment_ids.to(device)
-            attention_ids = attention_ids.to(device)
-            label = label.to(device)
+            forward_input_ids = data[0].to(device)
+            forward_segment   = data[1].to(device)
+            forward_attention = data[2].to(device)
+            forward_label     = data[3].to(device)
+
+            reverse_input_ids = data[4].to(device)
+            reverse_segment   = data[5].to(device)
+            reverse_attention = data[6].to(device)
+            reverse_label     = data[7].to(device)
 
             optimizer.zero_grad()
-            logit = net(
-                    input_ids=input_ids,
-                    segment_ids=segment_ids,
-                    attention_ids=attention_ids)
-            step_loss = criterion(logit, label)
-            step_loss.backward()
+            forward_mlm_loss, forward_seq_loss, forward_seq_logit = net(
+                input_ids=forward_input_ids,
+                attention_mask=forward_attention,
+                token_type_ids=forward_segment,
+                mask_label=forward_input_ids,
+                sequence_label=forward_label)
+            reverse_mlm_loss, reverse_seq_loss, reverse_seq_logit = net(
+                input_ids=reverse_input_ids,
+                attention_mask=reverse_attention,
+                token_type_ids=reverse_segment,
+                mask_label=reverse_input_ids,
+                sequence_label=reverse_label)
+            
+            loss  = forward_mlm_loss * 1.0
+            loss += forward_seq_loss * 1.0
+            loss += reverse_mlm_loss * 1.0
+            loss += reverse_seq_loss * 1.0
+            loss.backward()
             optimizer.step()
 
-            pred = torch.argmax(logit, axis=1)
-            pred = pred.eq(label).sum().item() / pred.shape[0]
+            forward_pred = torch.argmax(forward_seq_logit, axis=1)
+            forward_pred = forward_pred.eq(forward_label).sum().item() / forward_pred.shape[0]
+            reverse_pred = torch.argmax(reverse_seq_logit, axis=1)
+            reverse_pred = reverse_pred.eq(reverse_label).sum().item() / reverse_pred.shape[0]
 
-            writer.add_scalar('data/step_train_loss', step_loss.item(), train_step)
-            writer.add_scalar('data/step_train_acc', pred, train_step)
-            writer.add_scalar('data/lr', scheduler.get_lr()[0], train_step)
+            train_mlm_loss += (forward_mlm_loss + reverse_mlm_loss).item()
+            train_seq_loss += (forward_seq_loss + reverse_seq_loss).item()
+            train_seq_acc  += (forward_pred + reverse_pred) / 2
 
-            train_loss += step_loss.item()
-            train_acc += pred
+            writer.add_scalar(
+                'data/step_mlm_loss',
+                (forward_mlm_loss + reverse_mlm_loss).item(),
+                train_step)
+            writer.add_scalar(
+                'data/step_seq_loss',
+                (forward_seq_loss + reverse_seq_loss).item(),
+                train_step)
+            writer.add_scalar(
+                'data/step_seq_acc',
+                (forward_pred + reverse_pred) / 2,
+                train_step)
 
             if train_step % config['valid_step'] == 0:
-                valid_step += 1
-                valid_loss, valid_acc = engine.bert.valid(
-                        net=net,
-                        criterion=criterion,
-                        dataloader=validloader,
-                        device=device)
-                engine.bert.save(
-                        net=net,
-                        save_path=f'saved/bert_{train_step}.pt')
-                scheduler.step()
+                if hvd.local_rank() == 0:
+                    torch.save(net.state_dict(), f'saved/albert_{train_step}.pt') 
 
-                print('-------------------------')
-                print(f'valid step : {valid_step}')
-                print(f'valid loss : {valid_loss}')
-                print(f'valid acc  : {valid_acc}')
-                print('-------------------------')
+        train_mlm_loss /= len(trainloader)
+        train_seq_loss /= len(trainloader)
+        train_seq_acc  /= len(trainloader)
 
-                writer.add_scalar('data/valid_loss', valid_loss, valid_step)
-                writer.add_scalar('data/valid_acc', valid_acc, valid_step)
+        writer.add_scalar('data/epoch_mlm_loss', train_mlm_loss, epoch)
+        writer.add_scalar('data/epoch_seq_loss', train_seq_loss, epoch)
+        writer.add_scalar('data/epoch_seq_acc',  train_seq_acc,  epoch)
 
-                net.train()
+        valid_mlm_loss, valid_seq_loss, valid_seq_acc = 0, 0, 0
+        net.eval()
+        for data in tqdm.tqdm(validloader):
 
-        train_loss /= len(trainloader)
-        train_acc /= len(trainloader)
+            forward_input_ids = data[0].to(device)
+            forward_segment   = data[1].to(device)
+            forward_attention = data[2].to(device)
+            forward_label     = data[3].to(device)
 
-        print('-------------------------')
-        print(f'epoch : {epoch}')
-        print(f'train loss : {train_loss}')
-        print(f'train acc  : {train_acc}')
-        print('-------------------------')
-        
-        writer.add_scalar('data/epoch_train_loss', train_loss, epoch)
-        writer.add_scalar('data/epoch_train_acc', train_acc, epoch)
+            reverse_input_ids = data[4].to(device)
+            reverse_segment   = data[5].to(device)
+            reverse_attention = data[6].to(device)
+            reverse_label     = data[7].to(device)
+
+            forward_input_ids = data[0].to(device)
+            forward_segment   = data[1].to(device)
+            forward_attention = data[2].to(device)
+            forward_label     = data[3].to(device)
+
+            reverse_input_ids = data[4].to(device)
+            reverse_segment   = data[5].to(device)
+            reverse_attention = data[6].to(device)
+            reverse_label     = data[7].to(device)
+
+            forward_mlm_loss, forward_seq_loss, forward_seq_logit = net(
+                input_ids=forward_input_ids,
+                attention_mask=forward_attention,
+                token_type_ids=forward_segment,
+                mask_label=forward_input_ids,
+                sequence_label=forward_label)
+            reverse_mlm_loss, reverse_seq_loss, reverse_seq_logit = net(
+                input_ids=reverse_input_ids,
+                attention_mask=reverse_attention,
+                token_type_ids=reverse_segment,
+                mask_label=reverse_input_ids,
+                sequence_label=reverse_label)
+
+            loss  = forward_mlm_loss * 1.0
+            loss += forward_seq_loss * 1.0
+            loss += reverse_mlm_loss * 1.0
+            loss += reverse_seq_loss * 1.0
+
+            valid_mlm_loss += (forward_mlm_loss + reverse_mlm_loss).item()
+            valid_seq_loss += (forward_seq_loss + reverse_seq_loss).item()
+            valid_seq_acc  += (forward_pred + reverse_pred) / 2
+
+        valid_mlm_loss /= len(validloader)
+        valid_seq_loss /= len(validloader)
+        valid_seq_acc  /= len(validloader)
+
+        writer.add_scalar('data/valid_mlm_loss', valid_mlm_loss, epoch)
+        writer.add_scalar('data/valid_seq_loss', valid_seq_loss, epoch)
+        writer.add_scalar('data/valid_seq_acc',  valid_seq_acc,  epoch)
+
+        print('################')
+        print(f'epoch             : {epoch}')
+        print(f'train_mlm_loss    : {train_mlm_loss}')
+        print(f'train_seq_loss    : {train_seq_loss}')
+        print(f'train_seq_acc     : {train_seq_acc}')
+        print(f'valid_mlm_loss    : {valid_mlm_loss}')
+        print(f'valid_seq_loss    : {valid_seq_loss}')
+        print(f'valid_seq_acc     : {valid_seq_acc}')
+        print('################')
 
 if __name__ == '__main__':
     main()

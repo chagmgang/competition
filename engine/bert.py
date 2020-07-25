@@ -2,74 +2,131 @@ import tqdm
 import torch
 import torchvision
 
-def save(net, save_path):
-    return torch.save(net.state_dict(), save_path)
+class TrainingClass:
 
-def valid(net, criterion, dataloader, device):
+    def __init__(self, config):
+
+        self.train_step = 0
+        self.config = config
+
+    def valid_combine(self, model, dataloader, device):
+
+        model.eval()
+        mlm_loss = 0
+        seq_loss = 0
+        mlm_acc = 0
+        seq_acc = 0
+
+        for input_ids, segment_ids, attention_mask, labels, seq_labels in tqdm.tqdm(dataloader):
+
+            input_ids = input_ids.to(device)
+            segment_ids = segment_ids.to(device)
+            attention_mask = attention_mask.to(device)
+            labels = labels.to(device)
+            seq_labels = seq_labels.to(device)
+
+            step_mlm_loss, step_mlm_acc = model.mlm_train(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    token_type_ids=segment_ids,
+                    labels=labels)
+            step_seq_loss, step_seq_acc = model.seq_train(
+                    input_ids=labels,
+                    attention_mask=attention_mask,
+                    token_type_ids=segment_ids,
+                    labels=seq_labels)
+
+            mlm_loss += step_mlm_loss.item()
+            seq_loss += step_seq_loss.item()
+            mlm_acc  += step_mlm_acc
+            seq_acc  += step_seq_acc
+
+        mlm_loss /= len(dataloader)
+        seq_loss /= len(dataloader)
+        mlm_acc  /= len(dataloader)
+        seq_acc  /= len(dataloader)
+
+        return mlm_loss, seq_loss, mlm_acc, seq_acc
+
+    def train_combine(self, model, dataloader, device, optimizer, writer):
+
+        model.train()
+        mlm_loss = 0
+        seq_loss = 0
+        mlm_acc = 0
+        seq_acc = 0
+
+        for input_ids, segment_ids, attention_mask, labels, seq_labels in tqdm.tqdm(dataloader):
+
+            self.train_step += 1
+            input_ids = input_ids.to(device)
+            segment_ids = segment_ids.to(device)
+            attention_mask = attention_mask.to(device)
+            labels = labels.to(device)
+            seq_labels = seq_labels.to(device)
+
+            optimizer.zero_grad()
+            step_mlm_loss, step_mlm_acc = model.mlm_train(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    token_type_ids=segment_ids,
+                    labels=labels)
+            step_seq_loss, step_seq_acc = model.seq_train(
+                    input_ids=labels,
+                    attention_mask=attention_mask,
+                    token_type_ids=segment_ids,
+                    labels=seq_labels)
+            comb_loss  = step_mlm_loss * self.config['weight_mlm']
+            comb_loss += step_seq_loss * self.config['weight_seq']
+            comb_loss.backward()
+            optimizer.step()
+
+            mlm_loss += step_mlm_loss.item()
+            seq_loss += step_seq_loss.item()
+            mlm_acc  += step_mlm_acc
+            seq_acc  += step_seq_acc
+
+            writer.add_scalar('data/step_mlm_loss', step_mlm_loss.item(), self.train_step)
+            writer.add_scalar('data/step_seq_loss', step_seq_loss.item(), self.train_step)
+            writer.add_scalar('data/step_mlm_acc', step_mlm_acc, self.train_step)
+            writer.add_scalar('data/step_seq_acc', step_seq_acc, self.train_step)
+
+        mlm_loss /= len(dataloader)
+        seq_loss /= len(dataloader)
+        mlm_acc  /= len(dataloader)
+        seq_acc  /= len(dataloader)
+
+        return mlm_loss, seq_loss, mlm_acc, seq_acc
+
+
+def train_mlm(model, dataloader, device, optimizer):
 
     loss = 0
     acc = 0
-    net.eval()
-
-    for input_ids, segment_ids, attention_ids, label in tqdm.tqdm(dataloader):
+    model.train()
+    for input_ids, segment_ids, attention_mask, labels in tqdm.tqdm(dataloader):
 
         input_ids = input_ids.to(device)
         segment_ids = segment_ids.to(device)
-        attention_ids = attention_ids.to(device)
-        label = label.to(device)
-
-        logit = net(
-                input_ids=input_ids,
-                segment_ids=segment_ids,
-                attention_ids=attention_ids)
-
-        step_loss = criterion(logit, label)
-        pred = torch.argmax(logit, axis=1)
-        pred = pred.eq(label).sum().item() / pred.shape[0]
-
-        loss += step_loss.item()
-        acc += pred
-
-    loss /= len(dataloader)
-    acc /= len(dataloader)
-    net.train()
-    return loss, acc
-
-
-def train(net, optimizer, criterion, dataloader, device):
-
-    loss = 0
-    acc = 0
-    net.train()
-    for before_input, before_segment, before_attention, after_input, after_segment, after_attention, label in tqdm.tqdm(dataloader):
-
-        before_input = before_input.to(device)
-        before_segment = before_segment.to(device)
-        before_attention = before_attention.to(device)
-        after_input = after_input.to(device)
-        after_segment = after_segment.to(device)
-        after_attention = after_attention.to(device)
-        label = label.to(device)
+        attention_mask = attention_mask.to(device)
+        labels = labels.to(device)
 
         optimizer.zero_grad()
-        logit = net(
-                before_input=before_input,
-                before_segment=before_segment,
-                before_attention=before_attention,
-                after_input=after_input,
-                after_segment=after_segment,
-                after_attention=after_attention)
-        step_loss = criterion(logit, label)
+        step_loss, predictions = model.mlm_loss(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                token_type_ids=segment_ids,
+                labels=labels)
         step_loss.backward()
         optimizer.step()
 
-        pred = torch.argmax(logit, axis=1)
-        pred = pred.eq(label).sum().item() / pred.shape[0]
-
         loss += step_loss.item()
-        acc += pred
 
     loss /= len(dataloader)
-    acc /= len(dataloader)
+    return loss
 
-    return loss, acc
+def load(net, load_path):
+    return net.load_state_dict(torch.load(load_path))        
+
+def save(net, save_path):
+    return torch.save(net.state_dict(), save_path)
