@@ -76,68 +76,40 @@ def main():
 
     optimizer = transformers.AdamW(
             params=net.parameters(),
-            lr=config['mlm_lr'],
+            lr=config['start_lr'],
             weight_decay=config['weight_decay'])
     optimizer = hvd.DistributedOptimizer(
             optimizer=optimizer,
             named_parameters=net.named_parameters())
+
+    scheduler_1 = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer=optimizer,
+            T_max=config['T_max'],
+            eta_min=config['eta_min'])
+    scheduler_2 = torch.optim.lr_scheduler.CyclicLR(
+            optimizer=optimizer,
+            base_lr=config['base_lr'],
+            max_lr=config['max_lr'],
+            step_size_up=config['step_size_up'],
+            step_size_down=config['step_size_down'],
+            cycle_momentum=False)
+
+    scheduler = [scheduler_1, scheduler_2]
 
     hvd.broadcast_parameters(
             net.state_dict(),
             root_rank=0)
 
     training_method = engine.bert.TrainingClass(
-            config=config)
-
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(
+            model=net,
             optimizer=optimizer,
-            gamma=config['gamma'])
-
-    train_step = 0
-    for epoch in range(100):
-
-        train_mlm_loss, train_seq_loss, train_mlm_acc, train_seq_acc = \
-                training_method.train_combine(
-                        model=net,
-                        dataloader=trainloader,
-                        device=device,
-                        optimizer=optimizer,
-                        writer=writer)
-
-        valid_mlm_loss, valid_seq_loss, valid_mlm_acc, valid_seq_acc = \
-                training_method.valid_combine(
-                        model=net,
-                        dataloader=validloader,
-                        device=device)
-
-        print('-------------')
-        print(f'epoch : {epoch}')
-        print(f'train mlm loss  : {train_mlm_loss}')
-        print(f'train mlm acc   : {train_mlm_acc}')
-        print(f'train seq loss  : {train_seq_loss}')
-        print(f'train seq acc   : {train_seq_acc}')
-        print(f'valid mlm loss  : {valid_mlm_loss}')
-        print(f'valid mlm acc   : {valid_mlm_acc}')
-        print(f'valid seq loss  : {valid_seq_loss}')
-        print(f'valid seq acc   : {valid_seq_acc}')
-        print(f'lr              : {scheduler.get_lr()[0]}')
-        print('-------------')
-
-        writer.add_scalar('data/train_mlm_loss', train_mlm_loss, epoch)
-        writer.add_scalar('data/train_seq_loss', train_seq_loss, epoch)
-        writer.add_scalar('data/train_mlm_acc' , train_mlm_acc, epoch)
-        writer.add_scalar('data/train_seq_acc' , train_seq_acc, epoch)
-        writer.add_scalar('data/valid_mlm_loss', valid_mlm_loss, epoch)
-        writer.add_scalar('data/valid_seq_loss', valid_seq_loss, epoch)
-        writer.add_scalar('data/valid_mlm_acc' , valid_mlm_acc, epoch)
-        writer.add_scalar('data/valid_seq_acc' , valid_seq_acc, epoch)
-        writer.add_scalar('data/lr'            , scheduler.get_lr()[0], epoch)
-
-        scheduler.step()
-
-        engine.bert.save(
-                net=net,
-                save_path=f'saved/albert_mlm_{epoch+1}.pt')
+            scheduler=scheduler,
+            config=config,
+            trainloader=trainloader,
+            validloader=validloader,
+            writer=writer,
+            device=device,
+            tokenizer=trainset.tokenizer)
 
 if __name__ == '__main__':
     main()

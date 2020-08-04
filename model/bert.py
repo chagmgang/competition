@@ -50,15 +50,13 @@ class Model(nn.Module):
 
     def mlm_criterion(self, input_ids, predictions, labels):
 
-        masked_index = ~input_ids.eq(labels)
+        
         predictions = torch.argmax(predictions, axis=2)
+        predictions = predictions.view(-1)
+        labels = labels.view(-1)
 
-        masked_predictions = predictions[masked_index]
-        masked_labels = labels[masked_index]
-
-        acc = masked_predictions.eq(masked_labels)
+        acc = predictions.eq(labels)
         acc = acc.sum().item() / acc.shape[0]
-
         return acc
 
     def forward(self, input_ids, attention_mask,
@@ -80,6 +78,17 @@ class Model(nn.Module):
         seq_loss, seq_acc = self.seq_criterion(seq_logit, seq_labels)
 
         return mlm_loss, mlm_acc, seq_loss, seq_acc
+
+    def prediction(self, input_ids, attention_mask, token_type_ids):
+
+        predictions, hiddens = self.albert_mlm(
+	        input_ids=input_ids,
+                attention_mask=attention_mask,
+                token_type_ids=token_type_ids,
+                output_hidden_states=True)
+        
+        seq_logit = self.prediction_seq(hiddens[self.config['layer']])
+        return seq_logit
 
     def seq_criterion(self, seq_logits, seq_labels):
 

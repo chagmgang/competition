@@ -13,15 +13,23 @@
 	"csv_file": "split/provided.csv",
         "mask_train_file": "split/mask_train.csv",
 	"mask_valid_file": "split/mask_valid.csv",
-        "mask_field": ["BEFORE_BODY", "AFTER_BODY"],
-	"mask_column": ["SEQUENCE1", "SEQUENCE2"],
         "weight_mlm": 1.0,
         "weight_seq": 1.0,
         "mask_ratio": 0.15,
         "batch_size": 3,
 	"num_workers": 8,
-	"mlm_lr": 3e-5,
-	"gamma": 0.7,
+	
+	"start_lr": 1e-7,
+	"T_max": 5,
+	"eta_min": 1e-5,
+	"base_lr": 1e-7,
+	"max_lr": 1e-5,
+	"step_size_up": 1,
+	"step_size_down": 3,
+
 	"weight_decay": 0.0,
-        "valid_step": 5000
+        "scheduler_step": 100,
+        "valid_step": 10000,
+	"max_iter": 250000,
+        "test_file": "split/provided.csv"
 }
