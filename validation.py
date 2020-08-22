@@ -21,7 +21,7 @@ def main():
     config = json.load(open('config.json'))
     device = torch.device('cuda')
     validset = dataset.dataset.ValidationDataset(
-        csv_file=config['test_file'],
+        csv_file='evaluation.csv',
         config=config)
     
     net = model.bert.Model(
@@ -61,11 +61,8 @@ def main():
         result['NEWS1'].append(news1)
         result['NEWS2'].append(news2)
 
-        if i == 100:
-            break
-
     dataframe = pd.DataFrame.from_dict(result)
-    dataframe.to_csv('evaluation.csv', index=False)
+    dataframe.to_csv('test.csv', index=False)
     
 if __name__ == '__main__':
     main()

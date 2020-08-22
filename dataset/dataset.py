@@ -262,10 +262,10 @@ class ValidationDataset(torch.utils.data.Dataset):
         data = self.dataframe.loc[idx]
 
         index = data['INDEX']
-        news1_headline = data['BEFORE_HEADLINE']
-        news1_body = data['BEFORE_BODY']
-        news2_headline = data['AFTER_HEADLINE']
-        news2_body = data['AFTER_BODY']
+        news1_headline = data['NEWS1_HEADLINE']
+        news1_body = data['NEWS1_BODY']
+        news2_headline = data['NEWS2_HEADLINE']
+        news2_body = data['NEWS2_BODY']
 
         news1 = self.make_seq(
                 headline=news1_headline,
@@ -292,6 +292,9 @@ class ValidationDataset(torch.utils.data.Dataset):
                 inputs=attention_mask,
                 length=self.config['seq_length'],
                 value=0)
+
+        print(f'news1 : {news1}')
+        print(f'news2 : {news2}')
 
         input_ids = torch.as_tensor([input_ids], dtype=torch.long)
         token_type_ids = torch.as_tensor([token_type_ids], dtype=torch.long)
